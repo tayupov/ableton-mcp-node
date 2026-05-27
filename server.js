@@ -10,29 +10,60 @@ const oscPort = new OSC.UDPPort({
   remotePort: 11000,
 });
 
-const responses = {};
+const pending = {};
 
 oscPort.on("message", (msg) => {
   console.error(`[osc] ${msg.address}`, msg.args);
-  responses[msg.address] = msg.args;
+  const resolve = pending[msg.address];
+  if (resolve) {
+    delete pending[msg.address];
+    resolve(msg.args);
+  }
 });
 
 oscPort.open();
 
 function sendAndWait(address, args = [], timeout = 300) {
   return new Promise((resolve) => {
-    delete responses[address];
+    pending[address] = resolve;
     oscPort.send({ address, args });
-    const start = Date.now();
-    const interval = setInterval(() => {
-      if (responses[address] !== undefined) {
-        clearInterval(interval);
-        resolve(responses[address]);
-      } else if (Date.now() - start > timeout) {
-        clearInterval(interval);
+    setTimeout(() => {
+      if (pending[address]) {
+        delete pending[address];
         resolve(null);
       }
-    }, 10);
+    }, timeout);
+  });
+}
+
+// requests: array of { args, key }; getKey extracts the lookup key from response vals
+function sendAndCollectMany(address, requests, getKey, timeout = 500) {
+  return new Promise((resolve) => {
+    const results = {};
+    const waiting = new Map(requests.map(r => [r.key, true]));
+
+    const handler = (msg) => {
+      if (msg.address !== address) return;
+      const vals = extractArgs(msg.args);
+      const key = getKey(vals);
+      if (waiting.has(key)) {
+        results[key] = vals;
+        waiting.delete(key);
+        if (waiting.size === 0) {
+          oscPort.removeListener("message", handler);
+          clearTimeout(timer);
+          resolve(results);
+        }
+      }
+    };
+
+    oscPort.on("message", handler);
+    const timer = setTimeout(() => {
+      oscPort.removeListener("message", handler);
+      resolve(results);
+    }, timeout);
+
+    for (const r of requests) oscPort.send({ address, args: r.args });
   });
 }
 
@@ -75,8 +106,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "song_get_many",
+      description: "Get multiple song-level properties in one call. Prefer this over calling song_get repeatedly. Same properties as song_get, excluding version, log_level, and track_names.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          properties: { type: "array", items: { type: "string" } },
+        },
+        required: ["properties"],
+      },
+    },
+    {
       name: "song_get",
-      description: "Get a song-level property. Properties: version, log_level, tempo, is_playing, current_song_time, song_length, signature_numerator, signature_denominator, loop, loop_start, loop_length, metronome, record_mode, session_record, arrangement_overdub, groove_amount, clip_trigger_quantization, midi_recording_quantization, punch_in, punch_out, can_undo, can_redo, root_note, scale_name, num_tracks, num_scenes, cue_points, track_names (requires index_min and index_max).",
+      description: "Get a song-level property. Use song_get_many when fetching multiple properties. Properties: version, log_level, tempo, is_playing, current_song_time, song_length, signature_numerator, signature_denominator, loop, loop_start, loop_length, metronome, record_mode, session_record, arrangement_overdub, groove_amount, clip_trigger_quantization, midi_recording_quantization, punch_in, punch_out, can_undo, can_redo, root_note, scale_name, num_tracks, num_scenes, cue_points, track_names (requires index_min and index_max).",
       inputSchema: {
         type: "object",
         properties: {
@@ -144,8 +186,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "tracks_get",
+      description: "Get a property for multiple tracks at once. Prefer this over calling track_get repeatedly. Properties: name, volume, panning, mute, solo, arm, color, color_index, fold_state.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          property: { type: "string" },
+          index_min: { type: "integer" },
+          index_max: { type: "integer" },
+        },
+        required: ["property", "index_min", "index_max"],
+      },
+    },
+    {
       name: "track_get",
-      description: "Get a track property. Properties: name, volume, panning, mute, solo, arm, color, color_index, send (requires send_index), fold_state, clips_name, num_devices, devices_name.",
+      description: "Get a single track property. Use tracks_get when fetching the same property across multiple tracks. Properties: name, volume, panning, mute, solo, arm, color, color_index, send (requires send_index), fold_state, clips_name, num_devices, devices_name.",
       inputSchema: {
         type: "object",
         properties: {
@@ -187,8 +242,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "clips_get",
+      description: "Get a property for multiple clips in one call. Prefer this over calling clip_get repeatedly. Same properties as clip_get.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          property: { type: "string" },
+          clips: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                track_index: { type: "integer" },
+                clip_index: { type: "integer" },
+              },
+              required: ["track_index", "clip_index"],
+            },
+          },
+        },
+        required: ["property", "clips"],
+      },
+    },
+    {
       name: "clip_get",
-      description: "Get a clip property. Properties: name, color, length, loop_start, loop_end, pitch_coarse, pitch_fine, gain, muted, is_playing, is_recording, start_marker, end_marker, warp_mode (0=Beats 1=Tones 2=Texture 3=Re-Pitch 4=Complex 6=Pro), launch_mode (0=Trigger 1=Gate 2=Toggle 3=Repeat), launch_quantization (0-14), notes.",
+      description: "Get a single clip property. Use clips_get when fetching the same property across multiple clips. Properties: name, color, length, loop_start, loop_end, pitch_coarse, pitch_fine, gain, muted, is_playing, is_recording, start_marker, end_marker, warp_mode (0=Beats 1=Tones 2=Texture 3=Re-Pitch 4=Complex 6=Pro), launch_mode (0=Trigger 1=Gate 2=Toggle 3=Repeat), launch_quantization (0-14), notes.",
       inputSchema: {
         type: "object",
         properties: {
@@ -201,7 +278,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "clip_set",
-      description: "Set a clip property. Properties: name (string), color (int), loop_start (float beats), loop_end (float beats), pitch_coarse (int semitones), pitch_fine (float cents), gain (float), muted (0/1), start_marker (float beats), end_marker (float beats), warp_mode (int), launch_mode (int), launch_quantization (int).",
+      description: "Set a clip property on one or multiple clips. Pass track_index+clip_index for a single clip, or a clips array to set the same property on many clips at once. Properties: name (string), color (int), loop_start (float beats), loop_end (float beats), pitch_coarse (int semitones), pitch_fine (float cents), gain (float), muted (0/1), start_marker (float beats), end_marker (float beats), warp_mode (int), launch_mode (int), launch_quantization (int).",
       inputSchema: {
         type: "object",
         properties: {
@@ -209,8 +286,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           clip_index: { type: "integer" },
           property: { type: "string" },
           value: {},
+          clips: {
+            type: "array",
+            description: "Set the same property on multiple clips at once",
+            items: {
+              type: "object",
+              properties: {
+                track_index: { type: "integer" },
+                clip_index: { type: "integer" },
+                value: {},
+              },
+              required: ["track_index", "clip_index", "value"],
+            },
+          },
         },
-        required: ["track_index", "clip_index", "property", "value"],
+        required: ["property"],
       },
     },
     {
@@ -227,8 +317,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "add_notes",
+      description: "Add multiple MIDI notes to a clip in one call. Always prefer this over calling add_note repeatedly.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          track: { type: "integer" },
+          slot: { type: "integer" },
+          notes: {
+            type: "array",
+            description: "Array of notes to add",
+            items: {
+              type: "object",
+              properties: {
+                pitch: { type: "integer", description: "MIDI note number (0-127)" },
+                start: { type: "number", description: "Start time in beats" },
+                duration: { type: "number", description: "Duration in beats" },
+                velocity: { type: "integer", description: "Velocity (0-127), default 100" },
+                mute: { type: "integer", description: "0 = audible, 1 = muted, default 0" },
+              },
+              required: ["pitch", "start", "duration"],
+            },
+          },
+        },
+        required: ["track", "slot", "notes"],
+      },
+    },
+    {
       name: "add_note",
-      description: "Add a MIDI note to a clip",
+      description: "Add a single MIDI note to a clip. Use add_notes instead when adding more than one note.",
       inputSchema: {
         type: "object",
         properties: {
@@ -312,16 +429,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "device_set",
-      description: "Set a device parameter value",
+      description: "Set one or more device parameter values in a single call. Pass a single parameter_index+value, or use the params array to set multiple at once.",
       inputSchema: {
         type: "object",
         properties: {
           track_index: { type: "integer" },
           device_index: { type: "integer" },
-          parameter_index: { type: "integer" },
-          value: { type: "number" },
+          parameter_index: { type: "integer", description: "For setting a single parameter" },
+          value: { type: "number", description: "For setting a single parameter" },
+          params: {
+            type: "array",
+            description: "For setting multiple parameters at once",
+            items: {
+              type: "object",
+              properties: {
+                parameter_index: { type: "integer" },
+                value: { type: "number" },
+              },
+              required: ["parameter_index", "value"],
+            },
+          },
         },
-        required: ["track_index", "device_index", "parameter_index", "value"],
+        required: ["track_index", "device_index"],
       },
     },
   ],
@@ -340,6 +469,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "show_message") {
     send("/live/api/show_message", [s(args.message)]);
     return ok(`Message shown: ${args.message}`);
+  }
+
+  if (name === "song_get_many") {
+    const results = await Promise.all(
+      args.properties.map(p => sendAndWait(`/live/song/get/${p}`).then(r => [p, extractArgs(r)]))
+    );
+    const lines = results.map(([p, val]) => val ? `${p}: ${val[0]}` : `${p}: unknown`);
+    return ok(lines.join("\n"));
   }
 
   if (name === "song_get") {
@@ -451,6 +588,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     throw new Error(`Unknown track action: ${action}`);
   }
 
+  if (name === "tracks_get") {
+    const { property, index_min, index_max } = args;
+    const indices = [];
+    for (let idx = index_min; idx <= index_max; idx++) indices.push(idx);
+    const results = await sendAndCollectMany(
+      `/live/track/get/${property}`,
+      indices.map(idx => ({ args: [i(idx)], key: idx })),
+      vals => vals[0],
+    );
+    const lines = indices.map(idx => {
+      const val = results[idx];
+      return val ? `track ${idx}: ${val[1]}` : `track ${idx}: unknown`;
+    });
+    return ok(lines.join("\n"));
+  }
+
   if (name === "track_get") {
     const { track_index, property, send_index } = args;
     if (property === "send") {
@@ -513,6 +666,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     throw new Error(`Unknown clip_slot action: ${action}`);
   }
 
+  if (name === "clips_get") {
+    const { property, clips } = args;
+    const results = await sendAndCollectMany(
+      `/live/clip/get/${property}`,
+      clips.map(c => ({ args: [i(c.track_index), i(c.clip_index)], key: `${c.track_index}_${c.clip_index}` })),
+      vals => `${vals[0]}_${vals[1]}`,
+    );
+    const lines = clips.map(c => {
+      const key = `${c.track_index}_${c.clip_index}`;
+      const val = results[key];
+      return val ? `track ${c.track_index} clip ${c.clip_index}: ${val[2]}` : `track ${c.track_index} clip ${c.clip_index}: unknown`;
+    });
+    return ok(lines.join("\n"));
+  }
+
   if (name === "clip_get") {
     const { track_index, clip_index, property } = args;
     if (property === "notes") {
@@ -531,15 +699,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "clip_set") {
-    const { track_index, clip_index, property, value } = args;
-    if (property === "name") {
-      send(`/live/clip/set/${property}`, [i(track_index), i(clip_index), s(value)]);
-    } else {
-      const floatProps = ["loop_start", "loop_end", "pitch_fine", "gain", "start_marker", "end_marker"];
-      const arg = floatProps.includes(property) ? f(value) : i(value);
-      send(`/live/clip/set/${property}`, [i(track_index), i(clip_index), arg]);
+    const { property, clips } = args;
+    const floatProps = ["loop_start", "loop_end", "pitch_fine", "gain", "start_marker", "end_marker"];
+    const entries = clips ?? [{ track_index: args.track_index, clip_index: args.clip_index, value: args.value }];
+    for (const c of entries) {
+      if (property === "name") {
+        send(`/live/clip/set/${property}`, [i(c.track_index), i(c.clip_index), s(c.value)]);
+      } else {
+        const arg = floatProps.includes(property) ? f(c.value) : i(c.value);
+        send(`/live/clip/set/${property}`, [i(c.track_index), i(c.clip_index), arg]);
+      }
     }
-    return ok(`clip ${track_index}/${clip_index} ${property} set to ${value}`);
+    return ok(`Set ${property} on ${entries.length} clip(s)`);
   }
 
   if (name === "clip_action") {
@@ -557,6 +728,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return ok("Loop duplicated");
     }
     throw new Error(`Unknown clip action: ${action}`);
+  }
+
+  if (name === "add_notes") {
+    const noteArgs = args.notes.flatMap(n => [
+      i(n.pitch), f(n.start), f(n.duration),
+      i(n.velocity ?? 100), i(n.mute ?? 0),
+    ]);
+    send("/live/clip/add/notes", [i(args.track), i(args.slot), ...noteArgs]);
+    return ok(`Added ${args.notes.length} notes to clip`);
   }
 
   if (name === "add_note") {
@@ -640,9 +820,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "device_set") {
-    const { track_index, device_index, parameter_index, value } = args;
-    send("/live/device/set/parameter/value", [i(track_index), i(device_index), i(parameter_index), f(value)]);
-    return ok(`Parameter ${parameter_index} set to ${value}`);
+    const { track_index, device_index, parameter_index, value, params } = args;
+    const entries = params ?? [{ parameter_index, value }];
+    for (const p of entries) {
+      send("/live/device/set/parameter/value", [i(track_index), i(device_index), i(p.parameter_index), f(p.value)]);
+    }
+    return ok(`Set ${entries.length} parameter(s) on device ${device_index}`);
   }
 
   throw new Error(`Unknown tool: ${name}`);
